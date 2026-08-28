@@ -31,18 +31,21 @@ class Qwen3MoeAttention(BaseOP):
         self.qo_attn_dim = self.num_qo_heads * head_dim
         self.kv_attn_dim = self.num_kv_heads * head_dim
         self.head_dim = head_dim
-        self.fp8_block = getattr(config, "expert_quant", "none") == "fp8_block"
-        if self.fp8_block:
-            # Block-fp8 checkpoint: q/k/v/o are fp8-e4m3 + 128x128 ``weight_scale_inv``.
-            # Column-merged along the output dim (q|k|v out dims are all /128). TP=1 only.
-            from freetoken.kernel.triton.fp8_block_linear import Fp8BlockColMerged
+        # Quantized checkpoints keep q/k/v/o native: block-fp8 (fp8-e4m3 + 128x128
+        # ``weight_scale_inv``) or modelopt NVFP4 (W4A16). Column-merged along the output dim
+        # (q|k|v out dims are all /128). TP=1 only; bf16 keeps the TP-aware layers below.
+        self.quant = (
+            "fp8_block" if getattr(config, "expert_quant", "none") == "fp8_block"
+            else "nvfp4" if getattr(config, "attn_quant", "none") == "nvfp4"
+            else "none"
+        )
+        if self.quant != "none":
+            from freetoken.models.quant_linear import make_col_merged
 
-            assert tp_size == 1, "block-fp8 attention supports TP=1 only"
-            assert not has_attn_bias, "block-fp8 attention has no bias"
-            self.qkv_proj = Fp8BlockColMerged(
-                config.hidden_size,
-                [self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim],
-                has_bias=False,
+            assert tp_size == 1, f"{self.quant} attention supports TP=1 only"
+            assert not has_attn_bias, f"{self.quant} attention has no bias"
+            self.qkv_proj = make_col_merged(
+                config, config.hidden_size, [self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim]
             )
         else:
             self.qkv_proj = LinearQKVMerged(
@@ -69,10 +72,10 @@ class Qwen3MoeAttention(BaseOP):
                 else None
             ),
         )
-        if self.fp8_block:
-            from freetoken.kernel.triton.fp8_block_linear import Fp8BlockLinear
+        if self.quant != "none":
+            from freetoken.models.quant_linear import make_replicated
 
-            self.o_proj = Fp8BlockLinear(self.qo_attn_dim, config.hidden_size, has_bias=False)
+            self.o_proj = make_replicated(config, self.qo_attn_dim, config.hidden_size)
         else:
             self.o_proj = LinearOProj(
                 head_dim * config.num_qo_heads,

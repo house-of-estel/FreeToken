@@ -201,6 +201,17 @@ class ShardReader:
         self._handles.clear()
 
 
+def nvfp4_parts_modelopt(f, raw_base: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Load a modelopt NVFP4 dense weight as ``(packed uint8 [O, IN//2], block scale fp8
+    [O, IN//16], per-output-row global fp16 [O])`` -- the dense W4A16 kernels' buffers. The
+    checkpoint's ``weight_scale_2`` is the per-tensor global scalar, broadcast per row."""
+    w = f.get_tensor(raw_base + ".weight")            # uint8 packed FP4 (2 codes/byte)
+    s = f.get_tensor(raw_base + ".weight_scale")      # fp8-e4m3 per-16 block scale
+    g2 = f.get_tensor(raw_base + ".weight_scale_2")   # per-tensor global scalar
+    g = g2.reshape(1).to(torch.float16).expand(w.shape[0]).contiguous()
+    return w, s, g
+
+
 def nvfp4_parts_ct(f, raw_base: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """compressed-tensors NVFP4 -> ``(packed uint8 [O, IN//2], block scale fp8 [O, IN//16],
     per-output-row global fp16 [O])`` for the W4A16 kernels."""
