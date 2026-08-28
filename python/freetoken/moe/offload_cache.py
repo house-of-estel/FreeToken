@@ -95,6 +95,32 @@ _BANK_BYTES_PER_EXPERT = {
     "ds_fp4": lambda H, I: 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32),
 }
 
+def auto_prefill_decode_tokens(num_experts: int, top_k: int) -> int:
+    """Default cap for the decode route: ``2 * E / top_k`` tokens, clamped to [16, 64].
+
+    M tokens route to at most M * top_k experts, so past E / top_k a chunk *can* touch every
+    expert; in practice routing repeats and cache hits keep the gather well below a whole
+    layer for some way beyond that (measured on Qwen3.6-35B-A3B, E=256 top_k=8: 94 to 136 ms
+    TTFT for 19 to 52-token chunks against ~750 ms for the whole-layer stream, i.e. the route
+    still wins at 1.6x E / top_k), hence the factor 2. The floor of 16 clears chat-template
+    overhead; the cap of 64 bounds the batched-decode kernels' batch and the warmup cost.
+    0 when there is nothing to save (E / top_k < 2)."""
+    if num_experts <= 0 or top_k <= 0 or num_experts // top_k < 2:
+        return 0
+    return min(64, max(16, 2 * num_experts // top_k))
+
+
+def prefill_decode_warmup_lengths(cap: int) -> list[int]:
+    """Prefill lengths that compile every kernel specialization the decode route can hit up
+    to ``cap`` tokens: the slot-cache ensure kernel specializes on
+    ``next_power_of_2(tokens * top_k)``, so one length per power-of-two token count (plus
+    the cap itself) covers every bucket. Lengths < 2 are the decode ladder's business."""
+    if cap < 2:
+        return []
+    lengths = {cap} | {1 << i for i in range(1, cap.bit_length()) if (1 << i) <= cap}
+    return sorted(length for length in lengths if length >= 2)
+
+
 # vLLM's marlin grouped-GEMM hands the full [cache_size] slot cache as its expert
 # dimension; moe_align_block_size requires round_up(experts, 32) < 1024, i.e. <= 992.
 MARLIN_MAX_CACHE_SIZE = 992
@@ -114,6 +140,12 @@ class OffloadMoeCache:
     # coalesced runs). Requires prefill_overlap, cache_size > 2 * num_experts and
     # the fused copy plan; silently falls back to the full-layer copy otherwise.
     prefill_hit_d2d: bool = False
+    # Prefill chunks of <= this many tokens take the decode route (ensure_experts +
+    # copy_missing of the routed experts only) instead of the whole-layer stream: M tokens
+    # touch at most M * top_k experts per layer, so for small M the gather moves far fewer
+    # bytes than the E experts a layer stream costs, and it leaves the prompt's experts
+    # resident for the decode that follows. 0 = never (every prefill streams whole layers).
+    prefill_decode_tokens: int = 0
     # "bf16" (default, dense expert weights) or one of the NVFP4 bank layouts:
     # "nvfp4" (native ModelOpt rows, FreeToken Triton kernels), "nvfp4_marlin"
     # (Marlin-tiled, vLLM W4A16 GEMM, sm_80-99) or "nvfp4_b12x" (flashinfer SM12x

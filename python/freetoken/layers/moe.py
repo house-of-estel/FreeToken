@@ -245,11 +245,18 @@ class OffloadMoELayer(MoELayer):
         rewrites expert ids into cache slot ids); pass a fresh tensor or a clone.
         """
         ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
+        if ctx.batch.is_prefill and not self._prefill_takes_decode_route(hidden_states):
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         else:
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)
         return self._maybe_all_reduce(out)
+
+    def _prefill_takes_decode_route(self, hidden_states: torch.Tensor) -> bool:
+        """A prefill chunk of at most ``cache.prefill_decode_tokens`` tokens fetches only its
+        routed experts through the decode path (LRU ensure + gather + batched-decode GEMM)
+        rather than streaming every expert of the layer; see ``auto_prefill_decode_tokens``."""
+        cache = self.offload_cache
+        return cache is not None and 0 < hidden_states.shape[0] <= cache.prefill_decode_tokens
 
     def decode_forward(
         self,
@@ -275,6 +282,8 @@ class OffloadMoELayer(MoELayer):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
+        if self._prefill_takes_decode_route(hidden_states):
+            return self._decode_routed(hidden_states, topk_weights, topk_ids)
         return self._prefill_routed(hidden_states, topk_weights, topk_ids)
 
     # ------------------------------------------------------------------

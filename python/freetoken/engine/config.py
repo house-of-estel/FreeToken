@@ -38,6 +38,10 @@ class EngineConfig:
     # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 12.8
     # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
+    # Prefill chunks of at most this many tokens take the decode route (LRU ensure + gather
+    # of just the routed experts) instead of streaming every expert of every layer. -1 = auto
+    # (2 * num_experts // top_k clamped to [16, 64] on the GPU offload path, 0 elsewhere), 0 = off.
+    moe_prefill_decode_tokens: int = -1
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
     # CPU MoE backend (--moe-backend cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.

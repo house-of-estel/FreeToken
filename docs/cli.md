@@ -85,6 +85,7 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, or a fraction) |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
+| `--moe-prefill-decode-tokens` | auto | Prefill chunks of at most N tokens fetch only their routed experts (decode route) instead of streaming every expert of every layer; auto = 2 x experts / top_k clamped to [16, 64] with GPU decode, off with a CPU executor; 0 = off |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
 
