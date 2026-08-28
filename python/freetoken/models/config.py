@@ -34,6 +34,26 @@ def detect_expert_quant(hf_config: Any) -> str:
     return "nvfp4" if "fp4" in str(algo).lower() else str(algo).lower()
 
 
+def detect_fp8_block_quant(hf_config: Any) -> tuple[str, tuple[int, int] | None]:
+    """Detect DeepSeek-V3-style 128x128 block-fp8 from HF ``quantization_config``.
+
+    Returns ``("fp8_block", (block_n, block_k))`` for a block-fp8 checkpoint (weights
+    fp8-e4m3 + per-block ``weight_scale_inv``, dynamic activation), else ``("none", None)``.
+    The quantization_config sits on the top-level hf_config (not ``text_config``).
+    """
+    quant = getattr(hf_config, "quantization_config", None)
+    if quant is None:
+        return "none", None
+    get = quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
+    method = str(get("quant_method") or get("quant_algo") or "").lower()
+    block = get("weight_block_size")
+    if method == "fp8" and block:
+        bs = tuple(int(x) for x in block)
+        assert bs == (128, 128), f"only 128x128 block-fp8 is supported, got {bs}"
+        return "fp8_block", bs
+    return "none", None
+
+
 def detect_compressed_tensors_nvfp4(hf_config: Any) -> bool:
     """Detect a compressed-tensors NVFP4 (W4A16) checkpoint (dense Qwen3.6-27B,
     Muse-Glimmer-30B-NVFP4, ...).

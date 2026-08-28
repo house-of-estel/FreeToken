@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from freetoken.models.config import ModelConfig, RotaryConfig
+from freetoken.models.config import ModelConfig, RotaryConfig, detect_fp8_block_quant
 
 
 def parse_config(hf_config: Any) -> ModelConfig:
@@ -19,6 +19,10 @@ def parse_config(hf_config: Any) -> ModelConfig:
     rope_theta = getattr(hf_config, "rope_theta", None)
     if rope_theta is None and rope_scaling is not None:
         rope_theta = rope_scaling["rope_theta"]
+    # Block-fp8 checkpoints (Qwen3-30B-A3B-FP8, Qwen3-235B-A22B-FP8, ...): routed experts and
+    # the attention projections are fp8-e4m3 + 128x128 ``weight_scale_inv``; embed/lm_head,
+    # norms and the router gate stay bf16.
+    expert_quant, weight_block_size = detect_fp8_block_quant(hf_config)
 
     return ModelConfig(
         num_layers=hf_config.num_hidden_layers,
@@ -47,6 +51,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
         moe_intermediate_size=getattr(hf_config, "moe_intermediate_size", 0),
         norm_topk_prob=bool(getattr(hf_config, "norm_topk_prob", False)),
         model_type=getattr(hf_config, "model_type", "qwen3_moe"),
+        expert_quant=expert_quant,
+        weight_block_size=weight_block_size,
         architectures=getattr(hf_config, "architectures", ["Qwen3MoeForCausalLM"]),
     )
 

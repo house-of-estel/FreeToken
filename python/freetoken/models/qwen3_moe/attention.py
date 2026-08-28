@@ -31,13 +31,27 @@ class Qwen3MoeAttention(BaseOP):
         self.qo_attn_dim = self.num_qo_heads * head_dim
         self.kv_attn_dim = self.num_kv_heads * head_dim
         self.head_dim = head_dim
-        self.qkv_proj = LinearQKVMerged(
-            hidden_size=config.hidden_size,
-            head_dim=config.head_dim,
-            num_qo_heads=config.num_qo_heads,
-            num_kv_heads=config.num_kv_heads,
-            has_bias=has_attn_bias,
-        )
+        self.fp8_block = getattr(config, "expert_quant", "none") == "fp8_block"
+        if self.fp8_block:
+            # Block-fp8 checkpoint: q/k/v/o are fp8-e4m3 + 128x128 ``weight_scale_inv``.
+            # Column-merged along the output dim (q|k|v out dims are all /128). TP=1 only.
+            from freetoken.kernel.triton.fp8_block_linear import Fp8BlockColMerged
+
+            assert tp_size == 1, "block-fp8 attention supports TP=1 only"
+            assert not has_attn_bias, "block-fp8 attention has no bias"
+            self.qkv_proj = Fp8BlockColMerged(
+                config.hidden_size,
+                [self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim],
+                has_bias=False,
+            )
+        else:
+            self.qkv_proj = LinearQKVMerged(
+                hidden_size=config.hidden_size,
+                head_dim=config.head_dim,
+                num_qo_heads=config.num_qo_heads,
+                num_kv_heads=config.num_kv_heads,
+                has_bias=has_attn_bias,
+            )
         if has_qk_norm:
             self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
             self.k_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
@@ -55,11 +69,16 @@ class Qwen3MoeAttention(BaseOP):
                 else None
             ),
         )
-        self.o_proj = LinearOProj(
-            head_dim * config.num_qo_heads,
-            config.hidden_size,
-            has_bias=False,
-        )
+        if self.fp8_block:
+            from freetoken.kernel.triton.fp8_block_linear import Fp8BlockLinear
+
+            self.o_proj = Fp8BlockLinear(self.qo_attn_dim, config.hidden_size, has_bias=False)
+        else:
+            self.o_proj = LinearOProj(
+                head_dim * config.num_qo_heads,
+                config.hidden_size,
+                has_bias=False,
+            )
 
     @nvtx_annotate("MHA")
     def forward(self, x: torch.Tensor) -> torch.Tensor:

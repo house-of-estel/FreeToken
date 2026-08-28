@@ -82,7 +82,7 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
         # models/loader.py stream_moe_expert_sources: gate_up [E, 2I, H], down [E, H, I], bf16
         return {"gate_up": 2 * I * H * 2, "down": H * I * 2}
     if fmt == "fp8_block":
-        # qwen3_5_moe/weight.py _build_fp8_expert_banks: fp8 weights + bf16 128x128 block
+        # models/fp8_block_banks.py build_fp8_expert_banks: fp8 weights + bf16 128x128 block
         # scales, trailing scale dim 16B-padded (same helper as the loader)
         B = 128
         return {
@@ -145,6 +145,16 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         moe_intermediate_size=768,
         expert_formats=("bf16",),
         aliases=("Qwen/Qwen3-30B-A3B-Thinking-2507",),
+    ),
+    AotModel(
+        name="Qwen/Qwen3-30B-A3B-FP8",
+        architecture="Qwen3MoeForCausalLM",
+        hidden_size=2048,
+        kv_groups=((4, 128),),
+        top_k=8,
+        moe_intermediate_size=768,
+        expert_formats=("fp8_block",),
+        aliases=("Qwen/Qwen3-30B-A3B-Thinking-2507-FP8",),
     ),
     AotModel(
         name="Qwen/Qwen3.5-35B-A3B",
