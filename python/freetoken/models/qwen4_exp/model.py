@@ -15,6 +15,8 @@ immediate combine::
 
 from __future__ import annotations
 
+import os
+
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -167,6 +169,26 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 emb.ngram_heads_vocab_sizes.copy_(torch.tensor(sizes, dtype=torch.int64))
                 emb.ngram_heads_offsets.copy_(torch.tensor(offsets, dtype=torch.int64))
                 emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
+            return 0
+
+        # FREETOKEN_PLE_TABLE=pageable leaves the ~47.7 GiB table on disk (mmapped, page-cache
+        # backed) instead of pinning it: no pin budget, RAM only for the working set. Costs the
+        # CUDA graphs (the CPU gather cannot be captured) and PCIe-vs-pagecache latency.
+        mode = os.environ.get("FREETOKEN_PLE_TABLE", "pinned").strip().lower()
+        if mode not in ("pinned", "pageable"):
+            raise ValueError(f"FREETOKEN_PLE_TABLE must be 'pinned' or 'pageable', got {mode!r}")
+        if mode == "pageable":
+            if engine_config.cuda_graph_max_bs != 0:
+                raise ValueError(
+                    "FREETOKEN_PLE_TABLE=pageable gathers PLE rows on the CPU, which cannot run "
+                    "under CUDA-graph capture; serve with --cuda-graph-max-bs 0"
+                )
+            from .ple import PageableTable
+            from .weight import locate_ple_table
+
+            located = locate_ple_table(engine_config.model_path, self._config.qwen4_args)
+            for ple in ple_layers:
+                ple.ple_embedding.attach_table(PageableTable(located))
             return 0
 
         from .weight import load_ple_table

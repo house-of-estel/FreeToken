@@ -224,6 +224,69 @@ def test_pinned_uva_zeroes_out_of_range_ids():
     assert torch.equal(rows[0], bank.tensor[0].cuda().to(torch.bfloat16))
 
 
+def _pageable_parts(tmp_path, rows: int, dim: int, num_shards: int, scale: float, seed: int = 11):
+    """A synthetic sharded PLE table saved through safetensors, located like the real one."""
+    import safetensors.torch
+    from freetoken.models.qwen4_exp.weight import locate_ple_table
+
+    gen = torch.Generator().manual_seed(seed)
+    full = (torch.randn(rows, dim, generator=gen) * 0.4).to(torch.float8_e4m3fn)
+    per = rows // num_shards
+    prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    tensors = {f"{prefix}.shard_{i}.weight": full[i * per : (i + 1) * per] for i in range(num_shards)}
+    tensors[f"{prefix}.weight_scale"] = torch.tensor(scale, dtype=torch.bfloat16)
+    safetensors.torch.save_file(tensors, str(tmp_path / "model-plefp8-00001.safetensors"))
+    args = SimpleNamespace(split_ngram_parts=num_shards, ngram_head_dim=dim)
+    return full, locate_ple_table(str(tmp_path), args)
+
+
+@requires_cuda
+def test_pageable_matches_gpu_resident(tmp_path):
+    """PageableTable (mmapped shards, CPU gather) equals the GPU-resident oracle, through
+    lookup, prefetch, a stale prefetch, an out=, and out-of-range ids."""
+    from freetoken.models.qwen4_exp.ple import PageableTable
+
+    rows, dim, scale = 8192, 160, 0.0234375
+    full, located = _pageable_parts(tmp_path, rows, dim, num_shards=4, scale=scale)
+    scale = float(located.weight_scale)  # bf16 round-trip, like the serving path
+    oracle = GpuResidentTable(full.cuda(), scale, dtype=torch.bfloat16)
+    pageable = PageableTable(located)
+
+    ids = torch.randint(0, rows, (37, 16), device="cuda")
+    want = oracle.lookup(ids)
+    assert torch.equal(pageable.lookup(ids), want)
+
+    pageable.prefetch(ids)
+    assert torch.equal(pageable.lookup(ids), want)
+
+    # a stale prefetch must be drained before its staging is reused
+    pageable.prefetch(ids)
+    other = torch.randint(0, rows, (37, 16), device="cuda")
+    assert torch.equal(pageable.lookup(other), oracle.lookup(other))
+
+    out = torch.empty(37, 16 * dim, dtype=torch.bfloat16, device="cuda")
+    assert pageable.lookup(ids, out) is out
+    assert torch.equal(out, want)
+
+    bad = torch.tensor([[0, rows, 1, -1]], device="cuda")
+    got = pageable.lookup(bad).view(4, dim)
+    assert got[1].abs().sum() == 0 and got[3].abs().sum() == 0
+    assert torch.equal(got[0], (full[0].cuda().to(torch.float32) * scale).to(torch.bfloat16))
+
+
+def test_locate_ple_table_matches_loaded_bank(tmp_path):
+    """locate_ple_table points at the same bytes load_ple_table reads into the bank."""
+    import numpy as np
+
+    full, located = _pageable_parts(tmp_path, 512, 160, num_shards=4, scale=1.0)
+    assert located.num_rows == 512 and located.rows_per_shard == 128
+    view = np.concatenate([
+        np.memmap(path, dtype=np.uint8, mode="r", offset=off, shape=(128, 160))
+        for path, off in located.parts
+    ])
+    assert (view == full.view(torch.uint8).numpy()).all()
+
+
 @pytest.mark.skipif(
     not os.environ.get("FREETOKEN_QWEN4EXP_MODEL"), reason="needs FREETOKEN_QWEN4EXP_MODEL"
 )

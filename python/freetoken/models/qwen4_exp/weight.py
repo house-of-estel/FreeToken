@@ -222,15 +222,29 @@ def _ple_table_files(folder: str) -> list[str]:
     return sorted(os.path.join(folder, shard) for shard in files)
 
 
-def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
-                   workers: int = 8, chunk: int = 8 << 20) -> PleTable:
-    """Concatenate the checkpoint's ``ngram_embedding.shard_<i>`` tensors into one pinned host bank.
+@dataclass(frozen=True)
+class PleTableParts:
+    """Where the n-gram table's row blocks live on disk.
+
+    ``parts`` is ``(path, byte offset)`` per shard, in shard-index (= row) order; every shard is
+    an equal ``[rows_per_shard, cols]`` fp8-e4m3 block. Enough to fill a bank
+    (:func:`load_ple_table`) or to mmap the blocks in place (``ple.PageableTable``)."""
+
+    parts: tuple[tuple[str, int], ...]
+    rows_per_shard: int
+    cols: int
+    weight_scale: torch.Tensor  # scalar, checkpoint dtype (bf16)
+
+    @property
+    def num_rows(self) -> int:
+        return len(self.parts) * self.rows_per_shard
+
+
+def locate_ple_table(model_path: str, qwen4_args) -> PleTableParts:
+    """Find and validate the ``ngram_embedding.shard_<i>`` blocks without reading them.
 
     The checkpoint splits the table into ``split_ngram_parts`` equal row blocks named by shard
-    index and scattered over the ``model-plefp8-*`` shards in header (lexicographic) order, so the
-    bank is filled shard by shard at ``shard_index * rows_per_shard``. Each read is O_DIRECT: the
-    table is ~47.7 GiB and must not also sit in the page cache while the bank holds the same bytes.
-    """
+    index and scattered over the ``model-plefp8-*`` shards in header (lexicographic) order."""
     folder = download_hf_weight(model_path)
     parts: dict[int, tuple[str, int, int]] = {}  # shard index -> (path, file offset, bytes)
     scale: torch.Tensor | None = None
@@ -254,7 +268,9 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
                 raise ValueError(f"PLE table shard {key} is {shape}, expected {[rows, cols]}")
             rows, cols = shape
             begin, end = meta["data_offsets"]
-            parts[int(match.group("shard"))] = (path, base + begin, end - begin)
+            if end - begin != shape[0] * shape[1]:
+                raise ValueError(f"PLE table shard {key} is {end - begin} B for shape {shape}")
+            parts[int(match.group("shard"))] = (path, base + begin)
 
     expected = int(qwen4_args.split_ngram_parts)
     if sorted(parts) != list(range(expected)):
@@ -265,6 +281,21 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
         raise ValueError(f"PLE table row is {cols} wide, config says {qwen4_args.ngram_head_dim}")
     if scale is None:
         raise ValueError("PLE table has no weight_scale")
+    return PleTableParts(
+        parts=tuple((parts[i][0], parts[i][1]) for i in range(expected)),
+        rows_per_shard=rows, cols=cols, weight_scale=scale,
+    )
+
+
+def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
+                   workers: int = 8, chunk: int = 8 << 20) -> PleTable:
+    """Concatenate the table's row blocks (:func:`locate_ple_table`) into one pinned host bank.
+
+    Each read is O_DIRECT: the table is ~47.7 GiB and must not also sit in the page cache while
+    the bank holds the same bytes."""
+    located = locate_ple_table(model_path, qwen4_args)
+    rows, cols, expected = located.rows_per_shard, located.cols, len(located.parts)
+    scale = located.weight_scale
 
     bank = HostBank((expected * rows, cols), torch.float8_e4m3fn)
     shard_bytes = rows * cols
@@ -272,11 +303,10 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
     try:
         buf = bank.memoryview()
         for shard in range(expected):
-            path, offset, nbytes = parts[shard]
-            assert nbytes == shard_bytes, f"PLE shard {shard} is {nbytes} B, expected {shard_bytes}"
-            read_range_into(buf, path, file_offset=offset, nbytes=nbytes,
+            path, offset = located.parts[shard]
+            read_range_into(buf, path, file_offset=offset, nbytes=shard_bytes,
                             dest_offset=shard * shard_bytes, workers=workers, chunk=chunk)
-            bar.update(nbytes)
+            bar.update(shard_bytes)
     finally:
         bar.close()
     if pin and torch.cuda.is_available():

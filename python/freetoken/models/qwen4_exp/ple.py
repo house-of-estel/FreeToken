@@ -18,6 +18,8 @@ gathers rows over UVA, optionally started early on a side stream (``PLELayer.sta
 
 from __future__ import annotations
 
+import os
+
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Protocol, Sequence, Tuple
@@ -202,6 +204,136 @@ class PinnedUVATable:
             rows = pending[1]
         else:
             rows = self._gather(row_ids, self._stage(row_ids.numel()))
+        rows = rows.view(*row_ids.shape[:-1], -1)
+        if out is None:
+            return rows
+        out.copy_(rows)
+        return out
+
+
+class PageableTable:
+    """PLE table left on disk: the checkpoint's row blocks are mmapped read-only and rows are
+    gathered on the CPU into a pinned staging buffer, copied up and dequantized on the GPU.
+
+    Nothing is pinned or materialized: the OS page cache keeps the hot rows and cold rows fault
+    in from disk, so the ~47.7 GiB table costs no pin budget and only as much RAM as its working
+    set (how llama.cpp serves this model on 64 GB boxes). The trade: the gather must read the row
+    ids on the host, so it cannot run under CUDA-graph capture -- serve with
+    ``--cuda-graph-max-bs 0``. ``prefetch`` hides the gather behind the early layers: an async
+    D2H of the ids on a side stream, then the mmap reads on a worker thread; ``lookup`` joins."""
+
+    def __init__(self, parts, *, device: torch.device | None = None, prefetch: bool = True) -> None:
+        import numpy as np
+
+        self._np = np
+        self._shards = [
+            np.memmap(path, dtype=np.uint8, mode="r", offset=offset,
+                      shape=(parts.rows_per_shard, parts.cols))
+            for path, offset in parts.parts
+        ]
+        self.rows_per_shard = int(parts.rows_per_shard)
+        self.num_rows = int(parts.num_rows)
+        self.head_dim = int(parts.cols)
+        self.scale = float(parts.weight_scale)
+        self.dtype = torch.bfloat16
+        self._device = device or torch.device("cuda", torch.cuda.current_device())
+        self._staging: torch.Tensor | None = None  # pinned uint8 [n, head_dim]
+        self._ids_staging: torch.Tensor | None = None  # pinned int64 [n]
+        self._copy_stream = torch.cuda.Stream(device=self._device) if prefetch else None
+        self._pool = None
+        if prefetch:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._pool = ThreadPoolExecutor(1, thread_name_prefix="ple-gather")
+        # Large (prefill) gathers are page-fault-bound, not disk-bound: fan the row reads out
+        # over a few threads (faults resolve concurrently; numpy releases the GIL for the copies).
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+
+        self._fanout = _TPE(int(os.environ.get("FREETOKEN_PLE_GATHER_THREADS", "8")),
+                            thread_name_prefix="ple-fan")
+        self._pending: Tuple[torch.Tensor, object] | None = None
+
+    def _pinned(self, current: torch.Tensor | None, n: int, shape, dtype) -> torch.Tensor:
+        if current is None or current.shape[0] < n:
+            current = torch.empty(shape, dtype=dtype, pin_memory=torch.cuda.is_available())
+        return current
+
+    def _gather_range(self, ids, out) -> None:
+        np = self._np
+        valid = (ids >= 0) & (ids < self.num_rows)
+        cids = np.where(valid, ids, 0)
+        shard_of = cids // self.rows_per_shard
+        local = cids - shard_of * self.rows_per_shard
+        for shard in np.unique(shard_of):
+            m = shard_of == shard
+            out[m] = self._shards[shard][local[m]]
+        out[~valid] = 0
+
+    def _host_gather(self, ids) -> "object":
+        """Gather rows from the mmapped blocks; ids outside the table read zeros (kernel parity)."""
+        np = self._np
+        n = ids.shape[0]
+        out = np.empty((n, self.head_dim), dtype=np.uint8)
+        workers = self._fanout._max_workers
+        if n < 8192 or workers <= 1:  # decode-sized gathers: pool dispatch costs more than the reads
+            self._gather_range(ids, out)
+            return out
+        step = (n + workers - 1) // workers
+        list(self._fanout.map(
+            lambda lo: self._gather_range(ids[lo : lo + step], out[lo : lo + step]),
+            range(0, n, step),
+        ))
+        return out
+
+    def _no_capture(self) -> None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "PageableTable gathers PLE rows on the CPU and cannot run under CUDA-graph "
+                "capture; serve with --cuda-graph-max-bs 0"
+            )
+
+    def prefetch(self, row_ids: torch.Tensor) -> None:
+        if self._pool is None or row_ids.numel() == 0:
+            return
+        self._no_capture()
+        if self._pending is not None:  # drain a stale prefetch before reusing the ids staging
+            self._pending[1].result()
+            self._pending = None
+        n = row_ids.numel()
+        self._ids_staging = ids_host = self._pinned(self._ids_staging, n, (n,), torch.int64)
+        stream = self._copy_stream
+        stream.wait_stream(torch.cuda.current_stream(self._device))
+        with torch.cuda.stream(stream):
+            ids_host[:n].copy_(row_ids.reshape(-1), non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(stream)
+        self._pending = (
+            row_ids,
+            self._pool.submit(self._wait_and_gather, done, ids_host, n),
+        )
+
+    def _wait_and_gather(self, done: "torch.cuda.Event", ids_host: torch.Tensor, n: int):
+        done.synchronize()
+        return self._host_gather(ids_host[:n].numpy())
+
+    def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        self._no_capture()
+        pending, self._pending = self._pending, None
+        if pending is not None and pending[0] is row_ids:
+            rows_u8 = pending[1].result()
+        else:
+            if pending is not None:
+                pending[1].result()  # the stale prefetch owns the ids staging
+            rows_u8 = self._host_gather(row_ids.reshape(-1).cpu().numpy())
+        n = rows_u8.shape[0]
+        self._staging = stage = self._pinned(
+            self._staging, n, (max(n, 1), self.head_dim), torch.uint8
+        )
+        stage[:n].numpy()[:] = rows_u8
+        rows = (
+            stage[:n].to(self._device, non_blocking=True)
+            .view(torch.float8_e4m3fn).to(torch.float32).mul_(self.scale).to(self.dtype)
+        )
         rows = rows.view(*row_ids.shape[:-1], -1)
         if out is None:
             return rows
@@ -709,6 +841,7 @@ class PLELayer(BaseOP):
 
 __all__ = [
     "GpuResidentTable",
+    "PageableTable",
     "NGramEmbedding",
     "ZeroTable",
     "PLELayer",
