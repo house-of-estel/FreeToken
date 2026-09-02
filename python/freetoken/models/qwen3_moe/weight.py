@@ -13,10 +13,17 @@ from freetoken.models.fp8_block_banks import (
 )
 from freetoken.models.loader import (
     MergeRule,
+    drop_page_cache,
     iter_merged_tensors,
     iter_stacked_experts,
     iter_weight_files,
+    nvfp4_parts_modelopt,
     shard_tensor,
+)
+from freetoken.models.nvfp4_banks import (
+    Nvfp4ExpertSourceSpec,
+    load_nvfp4_expert_source_banks,
+    load_nvfp4_expert_source_banks_parallel,
 )
 from freetoken.utils import cached_load_hf_config
 from tqdm import tqdm
@@ -47,6 +54,26 @@ _FP8_EXPERT_SPEC = Fp8BlockExpertSpec(
 _FP8_QKV_PARTS = (".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj")
 _FP8_QKV_FUSED = ".self_attn.qkv_proj"
 _FP8_KIND_SUFFIXES = (".weight_scale_inv", ".weight")
+
+
+# modelopt NVFP4 checkpoint (nvidia/Qwen3-30B-A3B-NVFP4): every Linear is packed FP4 --
+# ``weight`` uint8 [O, IN/2] + ``weight_scale`` fp8 [O, IN/16] + scalar ``weight_scale_2``;
+# routed experts per-expert under ``model.layers.N.mlp.experts.E.{proj}``; ``input_scale`` /
+# ``k_scale`` / ``v_scale`` (W4A4 / FP8-KV static scales) are unused and dropped.
+_NVFP4_EXPERT_KEY_RE = re.compile(
+    r"^model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
+)
+_NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
+    key_pattern=_NVFP4_EXPERT_KEY_RE,
+    proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
+    layer_to_bank=lambda layer, config: layer,  # every layer is MoE
+    desc="Qwen3-MoE NVFP4 experts",
+)
+_NVFP4_DROP_SUFFIXES = (
+    ".weight_scale", ".weight_scale_2", ".input_scale", ".k_scale", ".v_scale",
+)
+_NVFP4_QKV_KINDS = (".weight", ".weight_scale", ".weight_global")
 
 
 def _split_kind(name: str) -> tuple[str, str]:
@@ -104,6 +131,81 @@ def _iter_weights_fp8(
         yield from iter_fp8_resident_experts(model_path, config, _FP8_EXPERT_SPEC)
 
 
+def _iter_weights_nvfp4(
+    model_path: str,
+    device: torch.device,
+    *,
+    include_moe_experts: bool,
+    include_non_moe: bool,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """modelopt NVFP4 dense weights kept native (W4A16): each quantized projection yields
+    ``(.weight uint8, .weight_scale fp8, .weight_global fp16 per-row)`` for the
+    ``Nvfp4Dense*`` buffers; q|k|v are concatenated per kind into ``qkv_proj``. bf16 tensors
+    (embed, lm_head, norms, router gate) pass through. Routed experts are never yielded here:
+    NVFP4 experts are served from the offload cache (``load_nvfp4_expert_sources``)."""
+    if get_tp_info().size > 1:
+        raise NotImplementedError("qwen3_moe NVFP4 weight loading supports TP=1 only")
+    if include_moe_experts:
+        raise NotImplementedError(
+            "qwen3_moe NVFP4 experts are offload-only (--moe-backend offload/cpu/hybrid)"
+        )
+    if not include_non_moe:
+        return
+    fuse_buf: dict[str, dict[int, tuple]] = {}
+    for file in tqdm(
+        iter_weight_files(model_path),
+        desc="Loading NVFP4 weights",
+        disable=not get_tp_info().is_primary(),
+    ):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            keyset = set(f.keys())
+            for raw_name in f.keys():
+                name = raw_name.removeprefix("language_model.")
+                if _EXPERT_PATTERN.match(name) is not None or name.endswith(_NVFP4_DROP_SUFFIXES):
+                    continue  # routed experts (offload cache) / scales consumed with .weight
+                if not name.endswith(".weight") or raw_name[: -len(".weight")] + ".weight_scale_2" not in keyset:
+                    yield name, f.get_tensor(raw_name)  # bf16 pass-through
+                    continue
+                base = name[: -len(".weight")]
+                parts = nvfp4_parts_modelopt(f, raw_name[: -len(".weight")])
+                for idx, part in enumerate(_FP8_QKV_PARTS):
+                    if base.endswith(part):
+                        key = base[: -len(part)] + _FP8_QKV_FUSED
+                        slots = fuse_buf.setdefault(key, {})
+                        slots[idx] = parts
+                        if len(slots) == len(_FP8_QKV_PARTS):
+                            del fuse_buf[key]
+                            for j, suf in enumerate(_NVFP4_QKV_KINDS):
+                                yield key + suf, torch.cat(
+                                    [slots[i][j] for i in range(len(_FP8_QKV_PARTS))], dim=0
+                                )
+                        break
+                else:
+                    for j, suf in enumerate(_NVFP4_QKV_KINDS):
+                        yield base + suf, parts[j]
+    assert not fuse_buf, f"qwen3_moe: incomplete NVFP4 qkv fusions: {sorted(fuse_buf)}"
+
+
+def load_nvfp4_expert_sources(model_path: str, config, *, layer_sink=None):
+    """CPU NVFP4 expert source banks for the offload cache (gate|up fused on the output-row
+    axis, down separate; ``weight_scale_2`` carried as the per-row global scale)."""
+    return load_nvfp4_expert_source_banks(
+        model_path, config, _NVFP4_SOURCE_SPEC,
+        drop_page_cache=drop_page_cache, primary=get_tp_info().is_primary(), layer_sink=layer_sink,
+    )
+
+
+def load_nvfp4_expert_sources_parallel(
+    model_path: str, config, *, workers: int = 8, chunk: int = 8 << 20, layer_sink=None
+):
+    """Same banks via the common chunked multi-threaded O_DIRECT reader."""
+    return load_nvfp4_expert_source_banks_parallel(
+        model_path, config, _NVFP4_SOURCE_SPEC,
+        drop_page_cache=drop_page_cache, primary=get_tp_info().is_primary(),
+        workers=workers, chunk=chunk, layer_sink=layer_sink,
+    )
+
+
 def setup_offload_expert_banks(
     model_path: str, model_config, *, device: torch.device, dtype: torch.dtype,
     dummy: bool = False, parallel: bool = False, workers: int = 8, chunk: int = 8 << 20,
@@ -112,7 +214,8 @@ def setup_offload_expert_banks(
     """Routed-expert offload banks. Exported, so it intercepts every qwen3_moe offload load:
     block-fp8 checkpoints build the shared fp8 banks (``FREETOKEN_FP8_EXPERTS=bf16``
     dequantizes at load instead); anything else defers to the generic provider for that
-    ``expert_quant`` (plain BF16 today), exactly as before this hook existed."""
+    ``expert_quant`` (bf16, or nvfp4 via ``load_nvfp4_expert_sources`` and the marlin/b12x
+    repack), exactly as before this hook existed."""
     eq = getattr(model_config, "expert_quant", "none")
     if eq != "fp8_block":
         from freetoken.moe.expert_banks import _PROVIDERS
@@ -136,6 +239,12 @@ def iter_weights(
     config = parse_config(cached_load_hf_config(model_path))
     if config.expert_quant == "fp8_block":
         yield from _iter_weights_fp8(
+            model_path, device,
+            include_moe_experts=include_moe_experts, include_non_moe=include_non_moe,
+        )
+        return
+    if config.expert_quant == "nvfp4":
+        yield from _iter_weights_nvfp4(
             model_path, device,
             include_moe_experts=include_moe_experts, include_non_moe=include_non_moe,
         )
@@ -198,9 +307,9 @@ def iter_weights_parallel(
     from freetoken.models.weight import iter_expert_tensors_parallel
 
     config = parse_config(cached_load_hf_config(model_path))
-    if config.expert_quant == "fp8_block":
+    if config.expert_quant != "none":
         raise NotImplementedError(
-            "qwen3_moe block-fp8 experts are loaded by setup_offload_expert_banks"
+            f"qwen3_moe {config.expert_quant} experts are loaded by setup_offload_expert_banks"
         )
     tp_info = get_tp_info()
 
@@ -225,4 +334,10 @@ def iter_weights_parallel(
     )
 
 
-__all__ = ["iter_weights", "iter_weights_parallel", "setup_offload_expert_banks"]
+__all__ = [
+    "iter_weights",
+    "iter_weights_parallel",
+    "load_nvfp4_expert_sources",
+    "load_nvfp4_expert_sources_parallel",
+    "setup_offload_expert_banks",
+]

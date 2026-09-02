@@ -20,6 +20,7 @@ from freetoken.models.loader import (
     drop_page_cache,
     iter_weight_files,
     nvfp4_parts_ct,
+    nvfp4_parts_modelopt,
 )
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
@@ -369,14 +370,7 @@ _NVFP4_MLP_LAYOUTS = (
 )
 
 
-def _nvfp4_parts(f, raw_base: str):
-    """Load a native NVFP4 weight as ``(packed uint8 [O, IN//2], block scale fp8 [O, IN//16],
-    per-output-row global fp16 [O])`` -- the dense W4A16 kernels' expected buffers."""
-    w = f.get_tensor(raw_base + ".weight")            # uint8 packed FP4 (2 codes/byte)
-    s = f.get_tensor(raw_base + ".weight_scale")      # fp8-e4m3 per-16 block scale
-    g2 = f.get_tensor(raw_base + ".weight_scale_2")   # per-tensor global scalar
-    g = g2.reshape(1).to(torch.float16).expand(w.shape[0]).contiguous()
-    return w, s, g
+_nvfp4_parts = nvfp4_parts_modelopt
 
 
 # Sentinel: ``base`` is not a dense projection the model keeps native NVFP4 (caller dequantizes).

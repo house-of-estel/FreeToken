@@ -157,6 +157,15 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         aliases=("Qwen/Qwen3-30B-A3B-Thinking-2507-FP8",),
     ),
     AotModel(
+        name="nvidia/Qwen3-30B-A3B-NVFP4",
+        architecture="Qwen3MoeForCausalLM",
+        hidden_size=2048,
+        kv_groups=((4, 128),),
+        top_k=8,
+        moe_intermediate_size=768,
+        expert_formats=_NVFP4_FORMATS,
+    ),
+    AotModel(
         name="Qwen/Qwen3.5-35B-A3B",
         architecture="Qwen3_5MoeForConditionalGeneration",
         hidden_size=2048,

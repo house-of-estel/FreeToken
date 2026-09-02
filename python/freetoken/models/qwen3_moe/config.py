@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from freetoken.models.config import ModelConfig, RotaryConfig, detect_fp8_block_quant
+from freetoken.models.config import (
+    ModelConfig,
+    RotaryConfig,
+    detect_expert_quant,
+    detect_fp8_block_quant,
+)
 
 
 def parse_config(hf_config: Any) -> ModelConfig:
@@ -23,6 +28,19 @@ def parse_config(hf_config: Any) -> ModelConfig:
     # the attention projections are fp8-e4m3 + 128x128 ``weight_scale_inv``; embed/lm_head,
     # norms and the router gate stay bf16.
     expert_quant, weight_block_size = detect_fp8_block_quant(hf_config)
+    attn_quant = "none"
+    if expert_quant == "none":
+        # modelopt NVFP4 (nvidia/Qwen3-30B-A3B-NVFP4): every Linear is packed FP4 -- routed
+        # experts (offload cache) and the attention projections (native W4A16); embed/lm_head,
+        # norms and the router gate stay bf16.
+        expert_quant = detect_expert_quant(hf_config)
+        if expert_quant == "nvfp4":
+            attn_quant = "nvfp4"
+        elif expert_quant != "none":
+            raise NotImplementedError(
+                f"qwen3_moe: unsupported quantization {expert_quant!r} (supported: 128x128 "
+                "block-fp8, modelopt NVFP4, bf16)"
+            )
 
     return ModelConfig(
         num_layers=hf_config.num_hidden_layers,
@@ -53,6 +71,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         model_type=getattr(hf_config, "model_type", "qwen3_moe"),
         expert_quant=expert_quant,
         weight_block_size=weight_block_size,
+        attn_quant=attn_quant,
         architectures=getattr(hf_config, "architectures", ["Qwen3MoeForCausalLM"]),
     )
 
