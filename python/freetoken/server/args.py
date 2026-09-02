@@ -613,6 +613,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-prefill-decode-tokens",
+        type=int,
+        dest="moe_prefill_decode_tokens",
+        default=ServerArgs.moe_prefill_decode_tokens,
+        help=(
+            "Prefill chunks of at most this many tokens (all sequences in the batch) fetch "
+            "only the experts they route to, through the decode path, instead of streaming "
+            "every expert of every layer over PCIe. -1 = auto: 2 * num_experts / top_k "
+            "clamped to [16, 64] with GPU-side decode, off with a CPU executor. 0 = off."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-prefill-hit-d2d",
         action="store_true",
         dest="moe_prefill_hit_d2d",

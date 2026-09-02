@@ -324,6 +324,72 @@ def test_prefill_overlap_waits_for_previous_prefill_release_after_begin(monkeypa
     assert copy_stream.waited == ["begin", "release0"]
 
 
+def test_auto_prefill_decode_tokens_break_even():
+    from freetoken.moe.offload_cache import auto_prefill_decode_tokens
+
+    # 2 * E / top_k tokens, clamped to [16, 64] (see the docstring for the measurement).
+    assert auto_prefill_decode_tokens(256, 8) == 64   # Qwen3.6-35B-A3B
+    assert auto_prefill_decode_tokens(128, 8) == 32   # Qwen3-30B-A3B
+    assert auto_prefill_decode_tokens(128, 4) == 64   # gpt-oss-120b
+    assert auto_prefill_decode_tokens(32, 4) == 16    # gpt-oss-20b
+    assert auto_prefill_decode_tokens(256, 6) == 64   # DeepSeek-V4-Flash
+    assert auto_prefill_decode_tokens(0, 8) == 0      # dense
+    assert auto_prefill_decode_tokens(8, 8) == 0      # nothing to save
+
+
+def test_prefill_decode_warmup_lengths_cover_every_ensure_bucket():
+    import math
+
+    from freetoken.moe.offload_cache import prefill_decode_warmup_lengths
+
+    for cap, top_k in ((16, 8), (32, 8), (64, 8), (21, 6), (16, 4), (3, 8)):
+        lengths = prefill_decode_warmup_lengths(cap)
+        assert lengths == sorted(set(lengths)) and all(2 <= L <= cap for L in lengths)
+        # every next_power_of_2(tokens * top_k) bucket a chunk of 2..cap tokens can hit is
+        # the bucket of some warmup length
+        buckets = {1 << math.ceil(math.log2(L * top_k)) for L in lengths}
+        for tokens in range(2, cap + 1):
+            assert (1 << math.ceil(math.log2(tokens * top_k))) in buckets, (cap, top_k, tokens)
+    assert prefill_decode_warmup_lengths(0) == [] and prefill_decode_warmup_lengths(1) == []
+
+
+def _route_calls(layer, cache, monkeypatch, num_tokens: int) -> dict:
+    """Run prefill_forward over ``num_tokens`` tokens with both movement paths stubbed;
+    report which one ran."""
+    topk_weights = torch.full((num_tokens, 2), 0.5, dtype=torch.float32)
+    topk_ids = torch.tensor([[2, 1]] * num_tokens, dtype=torch.int32)
+    hidden_states = torch.randn(num_tokens, 8)
+    calls = {}
+    monkeypatch.setattr(
+        "freetoken.layers.moe.fused_topk",
+        lambda *, hidden_states, gating_output, topk, renormalize: (topk_weights, topk_ids),
+    )
+    monkeypatch.setattr(cache, "materialize_layer", lambda layer_id: calls.setdefault("streamed_layer", layer_id))
+    monkeypatch.setattr(cache, "ensure_experts", lambda layer_id, ids: calls.setdefault("ensured_layer", layer_id))
+    monkeypatch.setattr(cache, "copy_missing", lambda: calls.setdefault("copied", True))
+    monkeypatch.setattr("freetoken.layers.moe.fused_experts_impl", lambda h, *a, **k: calls.setdefault("kernel", "prefill") and h)
+    monkeypatch.setattr("freetoken.layers.moe.fused_experts_decode_impl", lambda h, *a, **k: calls.setdefault("kernel", "decode") and h)
+    layer.prefill_forward(hidden_states, torch.randn(num_tokens, 4))
+    return calls
+
+
+def test_small_prefill_takes_the_decode_route(monkeypatch):
+    layer, cache = _make_layer_and_cache()
+    cache.prefill_decode_tokens = 2
+
+    small = _route_calls(layer, cache, monkeypatch, num_tokens=2)
+    assert small["ensured_layer"] == 0 and small["copied"] and small["kernel"] == "decode"
+    assert "streamed_layer" not in small
+
+    big = _route_calls(layer, cache, monkeypatch, num_tokens=3)
+    assert big["streamed_layer"] == 0 and big["copied"] and big["kernel"] == "prefill"
+    assert "ensured_layer" not in big
+
+    cache.prefill_decode_tokens = 0  # off: every prefill streams whole layers
+    off = _route_calls(layer, cache, monkeypatch, num_tokens=1)
+    assert off["streamed_layer"] == 0 and "ensured_layer" not in off
+
+
 def test_offload_moe_layer_decode_forward_uses_remapped_slot_ids(monkeypatch):
     layer, cache = _make_layer_and_cache()
     topk_weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32)

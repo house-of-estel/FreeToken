@@ -427,9 +427,13 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
-        if config.attention_backend.split(",")[0] == "triton":
-            # Prefill runs on the first comma part; warm its autotune cache.
-            self._warmup_prefill()
+        attn_triton = config.attention_backend.split(",")[0] == "triton"
+        cache = self.moe_offload_cache
+        route_on = cache is not None and cache.prefill_decode_tokens > 0
+        if attn_triton or route_on:
+            # Prefill runs on the first comma part; warm its autotune cache. The MoE prefill
+            # decode route has token-count specializations of its own to warm (see below).
+            self._warmup_prefill(attn_triton=attn_triton)
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -625,6 +629,14 @@ class Engine:
             )
             # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
             cache.cpu_layer_ids = cpu_layer_ids
+            cache.prefill_decode_tokens = _resolve_prefill_decode_tokens(
+                config, decode_target, cpu_layer_ids
+            )
+            if cache.prefill_decode_tokens:
+                logger.info_rank0(
+                    f"MoE prefill: chunks of <= {cache.prefill_decode_tokens} tokens fetch only "
+                    "their routed experts (decode route); longer chunks stream whole layers"
+                )
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         else:
@@ -945,20 +957,33 @@ class Engine:
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     @torch.inference_mode()
-    def _warmup_prefill(self) -> None:
-        """Compile the Triton prefill path before the first real request.
+    def _warmup_prefill(self, attn_triton: bool = True) -> None:
+        """Compile the prefill path before the first real request.
 
         Decode CUDA graph capture warms the decode path, but the first prefill
         can still pay Triton/cublas setup costs. Use the dummy request row and
         restore it afterwards so padded decode graph replay keeps using the
-        dedicated dummy KV slot.
+        dedicated dummy KV slot. ``attn_triton``: the triton attention backend's
+        autotune lengths (80, 128) are only worth running when that backend serves prefill.
         """
         if self.max_seq_len < 2:
             return
 
-        warmup_lens = [min(80, self.max_seq_len)]
-        if self.max_seq_len >= 128:
-            warmup_lens.append(128)
+        warmup_lens = []
+        if attn_triton:
+            warmup_lens.append(min(80, self.max_seq_len))
+            if self.max_seq_len >= 128:
+                warmup_lens.append(128)
+        cache = self.moe_offload_cache
+        if cache is not None and cache.prefill_decode_tokens > 0:
+            # The decode route's kernels specialize on the token count (flashlib's lru_ensure
+            # on next_power_of_2(tokens * top_k)); a first request of a new length would
+            # otherwise pay a Triton compile (1.5 to 7.5 s measured) instead of the route's
+            # ~100 ms. One warmup prefill per bucket, up to the cap.
+            from freetoken.moe.offload_cache import prefill_decode_warmup_lengths
+
+            cap = min(cache.prefill_decode_tokens, self.max_seq_len)
+            warmup_lens.extend(prefill_decode_warmup_lengths(cap))
         warmup_lens = sorted({length for length in warmup_lens if length >= 2})
         if not warmup_lens:
             return
@@ -1031,6 +1056,28 @@ def _model_expert_bytes(bench_fmt: str, model_config) -> int | None:
     if geometry is None or per_expert is None:
         return None
     return int(per_expert(geometry["hidden"], geometry["inter"]))
+
+
+def _resolve_prefill_decode_tokens(config: EngineConfig, decode_target: str, cpu_layer_ids) -> int:
+    """--moe-prefill-decode-tokens: explicit value, or auto. The decode route runs the
+    batched-decode kernels on the GPU slot cache; a CPU executor (cpu/hybrid backends, or
+    --moe-cpu-layers) sizes its per-batch buffers for decode batches, so auto is off there."""
+    tokens = config.moe_prefill_decode_tokens
+    cpu_executor = decode_target != "gpu" or bool(cpu_layer_ids)
+    if tokens > 0 and cpu_executor:
+        logger.warning_rank0(
+            f"--moe-prefill-decode-tokens {tokens}: the decode route needs GPU-side decode; "
+            "this configuration decodes (some layers) on the CPU executor, so it is disabled"
+        )
+        return 0
+    if tokens >= 0:
+        return tokens
+    if cpu_executor:
+        return 0
+    from freetoken.moe.offload_cache import auto_prefill_decode_tokens
+
+    mc = config.model_config
+    return auto_prefill_decode_tokens(int(mc.num_experts), int(mc.num_experts_per_tok))
 
 
 def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
@@ -1249,6 +1296,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_hybrid_max_fetch": -1,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
+    "moe_prefill_decode_tokens": 0,
     "expert_load": "auto",
 }
 
