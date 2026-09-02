@@ -8,6 +8,7 @@ from freetoken.models.config import (
     ModelConfig,
     RotaryConfig,
     detect_compressed_tensors_nvfp4,
+    detect_fp8_block_quant,
 )
 
 
@@ -20,23 +21,7 @@ def _quant_accessor(hf_config: Any):
     return quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
 
 
-def _fp8_block_quant(hf_config: Any) -> tuple[str, tuple[int, int] | None]:
-    """Detect DeepSeek-V3-style 128x128 block-fp8 from HF ``quantization_config``.
-
-    Returns ``("fp8_block", (block_n, block_k))`` for a block-fp8 checkpoint (weights
-    fp8-e4m3 + per-block ``weight_scale_inv``, dynamic activation), else ``("none", None)``.
-    The quantization_config sits on the top-level hf_config (not ``text_config``).
-    """
-    get = _quant_accessor(hf_config)
-    if get is None:
-        return "none", None
-    method = str(get("quant_method") or get("quant_algo") or "").lower()
-    block = get("weight_block_size")
-    if method == "fp8" and block:
-        bs = tuple(int(x) for x in block)
-        assert bs == (128, 128), f"only 128x128 block-fp8 is supported, got {bs}"
-        return "fp8_block", bs
-    return "none", None
+_fp8_block_quant = detect_fp8_block_quant
 
 
 def _expert_quant(hf_config: Any) -> str:
